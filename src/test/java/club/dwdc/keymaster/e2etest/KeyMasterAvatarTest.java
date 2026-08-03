@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
@@ -903,6 +904,104 @@ class KeyMasterAvatarTest {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(salt, "HmacSHA256"));
         return mac.doFinal(sharedX);
+    }
+
+    // ==================== Relay reconnect tests ====================
+    // Test avatar recovery from relay disruptions (Mission 26.1.1.2).
+    // Does not trigger D-Bus (no logind in containers) — validates
+    // nostr-sdk auto-reconnect + re-subscribe.
+    //
+    // Note: a relay restart test (strfry container restart) is not
+    // included because it also kills the daemon's relay connection,
+    // and the Java core NostrTransport lacks auto-reconnect. The
+    // Android client has reconnect (Mission 22.7) but it's not
+    // available in the test harness. The network partition test
+    // below is the correct E2E simulation: only the avatar loses
+    // its connection while the daemon stays connected.
+
+    @Test
+    @Order(45)
+    void relayNetworkPartitionRecovery() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-net-partition.json", "ssh");
+
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            Thread.sleep(2000);
+
+            // Verify SSH agent works before disruption
+            var baseline = avatar.execInContainer("ssh-add", "-l");
+            assertEquals(0, baseline.getExitCode(),
+                    "ssh-add should work before network partition. stderr: " + baseline.getStderr());
+            log.info("Baseline ssh-add OK before network partition");
+
+            // Disconnect avatar from Docker network (simulates sleep/wake —
+            // TCP connection dies but relay stays running)
+            log.info("Disconnecting avatar from network...");
+            var docker = DockerClientFactory.instance().client();
+            docker.disconnectFromNetworkCmd()
+                    .withContainerId(avatar.getContainerId())
+                    .withNetworkId(network.getId())
+                    .exec();
+
+            Thread.sleep(5000);
+
+            // Reconnect avatar to network (simulates wake)
+            log.info("Reconnecting avatar to network...");
+            docker.connectToNetworkCmd()
+                    .withContainerId(avatar.getContainerId())
+                    .withNetworkId(network.getId())
+                    .withContainerNetwork(
+                            new com.github.dockerjava.api.model.ContainerNetwork()
+                                    .withAliases(java.util.List.of("avatar")))
+                    .exec();
+
+            log.info("Network reconnected, waiting for avatar to recover...");
+
+            // Retry ssh-add — allow time for nostr-sdk auto-reconnect (~10s)
+            var result = retrySshAdd(avatar, 8, 3000);
+            assertEquals(0, result.getExitCode(),
+                    "ssh-add should work after network partition (without re-attach). stderr: "
+                            + result.getStderr());
+            log.info("ssh-add OK after network partition: {}", result.getStdout().trim());
+        } finally {
+            // Ensure avatar is reconnected to the network for subsequent tests
+            try {
+                DockerClientFactory.instance().client()
+                        .connectToNetworkCmd()
+                        .withContainerId(avatar.getContainerId())
+                        .withNetworkId(network.getId())
+                        .withContainerNetwork(
+                                new com.github.dockerjava.api.model.ContainerNetwork()
+                                        .withAliases(java.util.List.of("avatar")))
+                        .exec();
+            } catch (Exception ignored) {
+                // Already connected
+            }
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    /**
+     * Retry ssh-add -l inside a container, returning the last result.
+     * Gives nostr-sdk time to auto-reconnect after relay disruption.
+     */
+    private static org.testcontainers.containers.Container.ExecResult retrySshAdd(
+            GenericContainer<?> container, int maxAttempts, long intervalMs) throws Exception {
+        org.testcontainers.containers.Container.ExecResult result = null;
+        for (int i = 1; i <= maxAttempts; i++) {
+            result = container.execInContainer("ssh-add", "-l");
+            log.info("ssh-add retry {}/{}: exit={}, stdout={}", i, maxAttempts,
+                    result.getExitCode(), result.getStdout().trim());
+            if (result.getExitCode() == 0) {
+                return result;
+            }
+            if (i < maxAttempts) {
+                Thread.sleep(intervalMs);
+            }
+        }
+        return result;
     }
 
     // ==================== Packaged layout tests ====================
