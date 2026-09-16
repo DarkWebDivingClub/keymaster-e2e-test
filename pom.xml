@@ -7,7 +7,7 @@
     <artifactId>club.dwdc.keymaster.e2etest</artifactId>
     <version>0.3.0</version>
 
-    <name>club.dwdc.keymaster.e2etest</name>
+    <name>keymaster-e2e-test</name>
     <description>End-to-end tests for KeyMaster — uses Testcontainers to run relay and avatar, embedded km-daemon.</description>
 
     <properties>
