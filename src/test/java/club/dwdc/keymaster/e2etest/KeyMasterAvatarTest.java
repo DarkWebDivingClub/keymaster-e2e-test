@@ -76,23 +76,23 @@ class KeyMasterAvatarTest {
 
     private static final String AVATAR_BINARY = System.getProperty(
             "avatar.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/keymaster-avatar");
+            "/home/rene/git/keymaster-avatar/target/release/keymaster-avatar");
 
     private static final String SSH_AVATAR_BINARY = System.getProperty(
             "ssh.avatar.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-ssh-sa");
+            "/home/rene/git/keymaster-avatar/target/release/km-ssh-sa");
 
     private static final String GPG_AVATAR_BINARY = System.getProperty(
             "gpg.avatar.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-gpg-sa");
+            "/home/rene/git/keymaster-avatar/target/release/km-gpg-sa");
 
     private static final String NOSTR_AVATAR_BINARY = System.getProperty(
             "nostr.avatar.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-nostr-sa");
+            "/home/rene/git/keymaster-avatar/target/release/km-nostr-sa");
 
     private static final String SCD_SHIM_BINARY = System.getProperty(
             "scd.shim.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/scd-shim");
+            "/home/rene/git/keymaster-avatar/target/release/scd-shim");
 
     @TempDir
     static Path kvHome;
