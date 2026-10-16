@@ -25,6 +25,7 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.utility.MountableFile;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import nostr.crypto.nip44.EncryptedPayloads;
@@ -115,8 +116,17 @@ class KeyMasterAvatarTest {
     @SuppressWarnings("resource")
     private static GenericContainer<?> avatarPackaged;
 
+    /** Second relay, so two realms can be reached over independent transports. */
+    @SuppressWarnings("resource")
+    private static GenericContainer<?> relay2;
+
+    /** Avatar reachable only over relay2 — the production topology, one relay per machine. */
+    @SuppressWarnings("resource")
+    private static GenericContainer<?> avatarOnRelay2;
+
     private static String avatarLoginXpub;
     private static String avatarPackagedLoginXpub;
+    private static String avatarOnRelay2LoginXpub;
 
     @BeforeAll
     static void startContainers() throws Exception {
@@ -241,6 +251,42 @@ class KeyMasterAvatarTest {
         }
         avatarPackagedLoginXpub = mp.group(1);
         log.info("Packaged avatar login xpub: {}", avatarPackagedLoginXpub);
+
+        // Second relay and an avatar that can only be reached through it. One
+        // relay per machine is the production topology, and it is what lets a
+        // test fail one transport without failing both.
+        relay2 = new GenericContainer<>("dockurr/strfry:1.0.4")
+                .withExposedPorts(7777)
+                .withNetwork(network)
+                .withNetworkAliases("relay2")
+                .withTmpFs(Map.of("/app/strfry-db", "rw"))
+                .withCopyFileToContainer(
+                        MountableFile.forClasspathResource("strfry.conf"),
+                        "/etc/strfry.conf")
+                .waitingFor(Wait.forListeningPort());
+        relay2.start();
+        log.info("Relay2 started on port {}", relay2.getMappedPort(7777));
+
+        avatarOnRelay2 = new GenericContainer<>(avatarImage)
+                .withCommand("--relay", "ws://relay2:7777", "--log-level", "debug")
+                .withNetwork(network)
+                .withNetworkAliases("avatar-relay2")
+                .dependsOn(relay2)
+                .withEnv("SSH_AUTH_SOCK", "/tmp/keymaster-avatar-ssh-agent.sock")
+                .withEnv("GNUPGHOME", "/tmp/gnupg-home")
+                .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("avatar-relay2"))
+                .waitingFor(Wait.forLogMessage(".*Local API listening.*", 1));
+        avatarOnRelay2.start();
+        log.info("Relay2 avatar container started");
+
+        Matcher m2 = Pattern.compile("Login xpub:\\s*(xpub[A-Za-z0-9]+)")
+                .matcher(avatarOnRelay2.getLogs());
+        if (!m2.find()) {
+            throw new IllegalStateException(
+                    "Could not find login xpub in relay2 avatar logs:\n" + avatarOnRelay2.getLogs());
+        }
+        avatarOnRelay2LoginXpub = m2.group(1);
+        log.info("Relay2 avatar login xpub: {}", avatarOnRelay2LoginXpub);
     }
 
     @Test
@@ -1004,6 +1050,275 @@ class KeyMasterAvatarTest {
         return result;
     }
 
+    // ==================== Multi-realm tests ====================
+    // Realms and avatars are independent axes: one realm can serve N avatars
+    // (the same identity on several desktops) and N realms can each serve one
+    // avatar (a different identity, or the same one under different policy).
+    // The QR scan is the fork between them, so there is one test per outcome.
+
+    /**
+     * Test 1 — "connect to an existing realm": one realm, two connectors, one
+     * relay. Both avatars serve the same identity, hence the same keys; what
+     * must differ is the per-connector session key. One relay deliberately:
+     * both encrypted streams are then visible to both avatars, so correct
+     * routing depends entirely on the derivation. A collision fails here, where
+     * two relays would mask it behind transport isolation.
+     */
+    @Test
+    @Order(200)
+    void oneRealmTwoConnectors_sameRelay() throws Exception {
+        Path first = writeDescriptor("descriptor-realm-join-1.json", "ssh", avatarLoginXpub);
+        Path second = writeDescriptor("descriptor-realm-join-2.json", "ssh",
+                avatarPackagedLoginXpub);
+
+        JsonObject created = attachNewRealm(first.toString(), "alice@atlanta.com",
+                "myFirstRealm", null);
+        int realmId = created.get("realmId").getAsInt();
+        assertEquals("myFirstRealm", created.get("realmName").getAsString());
+
+        try {
+            JsonObject joined = attachJoiningRealm(second.toString(), realmId);
+            assertEquals(realmId, joined.get("realmId").getAsInt(),
+                    "the second scan joins the realm rather than creating one");
+            assertNotEquals(created.get("connectorId").getAsInt(),
+                    joined.get("connectorId").getAsInt(),
+                    "each avatar link gets its own connector index, hence its own session key");
+
+            Thread.sleep(2500);
+
+            // Both avatars serve the realm simultaneously, over one relay
+            var firstResult = retrySshAdd(avatar, 5, 2000);
+            assertEquals(0, firstResult.getExitCode(),
+                    "ssh-add must work on the first avatar. stderr: " + firstResult.getStderr());
+            var secondResult = retrySshAdd(avatarPackaged, 5, 2000);
+            assertEquals(0, secondResult.getExitCode(),
+                    "ssh-add must work on the second avatar at the same time. stderr: "
+                            + secondResult.getStderr());
+
+            // Same realm, same identity — so the same key on both
+            assertEquals(sshFingerprints(avatar), sshFingerprints(avatarPackaged),
+                    "one realm serves identical keys to all of its connectors");
+
+            JsonObject status = status();
+            assertTrue(status.get("attached").getAsBoolean());
+            assertEquals(1, status.getAsJsonArray("realms").size(), "one realm");
+            assertEquals(2, status.getAsJsonArray("realms").get(0).getAsJsonObject()
+                    .getAsJsonArray("connectors").size(), "two connectors");
+
+            // Detaching one connector leaves the realm and the other connector alive
+            detachConnector(realmId, joined.get("connectorId").getAsInt());
+            Thread.sleep(1500);
+
+            JsonObject afterDetach = status();
+            assertEquals(1, afterDetach.getAsJsonArray("realms").size(),
+                    "the realm survives losing one of its connectors");
+            assertEquals(1, afterDetach.getAsJsonArray("realms").get(0).getAsJsonObject()
+                    .getAsJsonArray("connectors").size());
+
+            var survivor = retrySshAdd(avatar, 5, 2000);
+            assertEquals(0, survivor.getExitCode(),
+                    "the remaining connector is unaffected. stderr: " + survivor.getStderr());
+
+            // The same avatar twice in one realm would collide on
+            // mangle(login_xpub), so both connectors would share channel keys.
+            JsonObject duplicate = new JsonObject();
+            duplicate.addProperty("descriptor", first.toString());
+            duplicate.addProperty("realm_id", realmId);
+            JsonObject refused = daemonController.handle("session.attach", duplicate);
+            assertTrue(refused.has("error"),
+                    "joining the same avatar to the same realm twice must be refused: " + refused);
+            assertTrue(refused.get("error").getAsString().contains("already has a connector"),
+                    "and refused for the right reason: " + refused);
+        } finally {
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
+    /**
+     * Test 2 — "create a new realm": two realms, one connector each, two
+     * relays, and deliberately the <em>same</em> identity in both. They serve
+     * byte-identical keys; what must differ is the realm key, which is what
+     * proves the realm discriminator works. Each reaches its avatar over its
+     * own relay, as every machine runs its own strfry in production.
+     */
+    @Test
+    @Order(210)
+    void twoRealmsSameIdentity_separateRelays() throws Exception {
+        Path onRelay = writeDescriptor("descriptor-realm-a.json", "ssh", avatarLoginXpub);
+        Path onRelay2 = writeDescriptorOn("descriptor-realm-b.json", "ssh",
+                avatarOnRelay2LoginXpub, relay2Url());
+
+        JsonObject realmA = attachNewRealm(onRelay.toString(), "alice@atlanta.com", "work", null);
+        JsonObject realmB = attachNewRealm(onRelay2.toString(), "alice@atlanta.com", "home", null);
+
+        int realmAId = realmA.get("realmId").getAsInt();
+        int realmBId = realmB.get("realmId").getAsInt();
+
+        try {
+            assertNotEquals(realmAId, realmBId, "two realms, two ids");
+            assertEquals("alice@atlanta.com", realmA.get("identity").getAsString());
+            assertEquals("alice@atlanta.com", realmB.get("identity").getAsString());
+
+            Thread.sleep(2500);
+
+            var a = retrySshAdd(avatar, 5, 2000);
+            assertEquals(0, a.getExitCode(), "realm A serves SSH. stderr: " + a.getStderr());
+            var b = retrySshAdd(avatarOnRelay2, 5, 2000);
+            assertEquals(0, b.getExitCode(), "realm B serves SSH. stderr: " + b.getStderr());
+
+            // Identical identity means identical keys: realms isolate sessions
+            // and transports, not key material
+            assertEquals(sshFingerprints(avatar), sshFingerprints(avatarOnRelay2),
+                    "the same identity in two realms serves the same keys");
+
+            assertEquals(2, status().getAsJsonArray("realms").size(), "two live realms");
+
+            // Tearing down one realm leaves the other serving
+            detachRealm(realmBId);
+            Thread.sleep(1500);
+            assertEquals(1, status().getAsJsonArray("realms").size());
+            var survivor = retrySshAdd(avatar, 5, 2000);
+            assertEquals(0, survivor.getExitCode(),
+                    "realm A is unaffected by realm B's teardown. stderr: "
+                            + survivor.getStderr());
+        } finally {
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
+    /**
+     * Test 3 — two relays, partition one. Proves per-connector connection state
+     * and independent reconnect: realm A keeps serving while realm B's avatar
+     * is cut off, and realm B recovers on its own when the network returns.
+     */
+    @Test
+    @Order(220)
+    void partitioningOneRealmLeavesTheOtherServing() throws Exception {
+        Path onRelay = writeDescriptor("descriptor-partition-a.json", "ssh", avatarLoginXpub);
+        Path onRelay2 = writeDescriptorOn("descriptor-partition-b.json", "ssh",
+                avatarOnRelay2LoginXpub, relay2Url());
+
+        attachNewRealm(onRelay.toString(), "alice@atlanta.com", "work", null);
+        attachNewRealm(onRelay2.toString(), "alice@atlanta.com", "home", null);
+
+        try {
+            Thread.sleep(2500);
+            assertEquals(0, retrySshAdd(avatar, 5, 2000).getExitCode());
+            assertEquals(0, retrySshAdd(avatarOnRelay2, 5, 2000).getExitCode());
+
+            var docker = DockerClientFactory.instance().client();
+            log.info("Partitioning the relay2 avatar...");
+            docker.disconnectFromNetworkCmd()
+                    .withContainerId(avatarOnRelay2.getContainerId())
+                    .withNetworkId(network.getId())
+                    .exec();
+            Thread.sleep(5000);
+
+            var unaffected = retrySshAdd(avatar, 3, 1500);
+            assertEquals(0, unaffected.getExitCode(),
+                    "realm A must keep serving while realm B is partitioned. stderr: "
+                            + unaffected.getStderr());
+
+            log.info("Reconnecting the relay2 avatar...");
+            docker.connectToNetworkCmd()
+                    .withContainerId(avatarOnRelay2.getContainerId())
+                    .withNetworkId(network.getId())
+                    .withContainerNetwork(
+                            new com.github.dockerjava.api.model.ContainerNetwork()
+                                    .withAliases(java.util.List.of("avatar-relay2")))
+                    .exec();
+
+            var recovered = retrySshAdd(avatarOnRelay2, 8, 3000);
+            assertEquals(0, recovered.getExitCode(),
+                    "realm B reconnects on its own backoff. stderr: " + recovered.getStderr());
+        } finally {
+            try {
+                DockerClientFactory.instance().client()
+                        .connectToNetworkCmd()
+                        .withContainerId(avatarOnRelay2.getContainerId())
+                        .withNetworkId(network.getId())
+                        .withContainerNetwork(
+                                new com.github.dockerjava.api.model.ContainerNetwork()
+                                        .withAliases(java.util.List.of("avatar-relay2")))
+                        .exec();
+            } catch (Exception ignored) {
+                // already connected
+            }
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
+    /**
+     * Test 4 — per-identity protocol filter. A realm's definition is a list of
+     * rows, each with its own filter, so this is the first case where a realm
+     * serves only <em>part</em> of an identity: both identities' SSH keys, but
+     * only the primary's Nostr key. One avatar is enough — what is under test
+     * is handler resolution, not transport.
+     */
+    @Test
+    @Order(230)
+    void perIdentityProtocolFilter() throws Exception {
+        JsonObject createParams = new JsonObject();
+        createParams.addProperty("identity", "alice@home.org");
+        createParams.addProperty("pgp_name", "Alice");
+        createParams.addProperty("pgp_email", "alice@home.org");
+        JsonObject created = daemonController.handle("identity.create", createParams);
+        assertFalse(created.has("error"), "identity.create failed: " + created);
+
+        Path descriptorFile = writeDescriptorOn("descriptor-filtered.json",
+                "ssh\",\"nostr", avatarLoginXpub, relayUrl());
+
+        // atlanta: everything. home.org: ssh only.
+        JsonArray identities = new JsonArray();
+        JsonObject homeOrg = new JsonObject();
+        homeOrg.addProperty("identity", "alice@home.org");
+        JsonArray protocols = new JsonArray();
+        protocols.add("ssh");
+        homeOrg.add("protocols", protocols);
+        identities.add(homeOrg);
+
+        JsonObject attached = attachNewRealm(descriptorFile.toString(),
+                "alice@atlanta.com", "filtered", identities);
+
+        try {
+            JsonArray names = attached.getAsJsonArray("identities");
+            assertEquals(2, names.size(), "the realm serves both identities: " + names);
+
+            Thread.sleep(2500);
+
+            var sshResult = retrySshAdd(avatar, 5, 2000);
+            assertEquals(0, sshResult.getExitCode(),
+                    "ssh-add must work. stderr: " + sshResult.getStderr());
+
+            var listed = avatar.execInContainer("ssh-add", "-L");
+            long keyCount = listed.getStdout().lines()
+                    .filter(line -> line.startsWith("ssh-"))
+                    .count();
+            assertEquals(2, keyCount,
+                    "both identities contribute their SSH key: " + listed.getStdout());
+
+            // home.org selected SSH only, so only atlanta's nostr key is served
+            String response = nostrSaRequest(avatar,
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_public_keys\",\"params\":{}}");
+            log.info("get_public_keys: {}", response);
+            JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+            JsonArray keys = json.getAsJsonArray("result");
+            assertEquals(1, keys.size(),
+                    "home.org selected ssh only, so it contributes no nostr key: " + response);
+
+            String served = keys.get(0).getAsJsonObject().get("public_key").getAsString();
+            assertEquals(64, served.length());
+            assertNotEquals(homeOrgNostrPubkey(), served,
+                    "the key served is atlanta's, not home.org's");
+        } finally {
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
     // ==================== Packaged layout tests ====================
     // These test the "installed as a .deb" scenario: binaries in /usr/lib/keymaster-avatar/
     // (off PATH), avatar in /usr/bin/, config in /etc/keymaster-avatar/.
@@ -1116,6 +1431,114 @@ class KeyMasterAvatarTest {
         return file;
     }
 
+    /** The Nostr pubkey of alice@home.org, derived directly from the seed. */
+    private static String homeOrgNostrPubkey() {
+        int H = 0x80000000;
+        int[] path = {
+                44 | H,
+                club.dwdc.keyvault.core.Protocol.NOSTR.coinType() | H,
+                club.dwdc.keyvault.core.Bip32KeyDerivator.mangle("alice@home.org") | H,
+                new club.dwdc.keyvault.core.AlgField(
+                        club.dwdc.keyvault.core.AlgField.ALG_SCHNORR, 0, 0).toIndex() | H,
+                new club.dwdc.keyvault.core.ConfigField(
+                        club.dwdc.keyvault.core.ConfigField.CSPRNG_NONE, 0).toIndex() | H
+        };
+        byte[] compressed = createVaultInProcess()
+                .execute(club.dwdc.keyvault.core.KeyVault.FN_GET_PUBLIC_KEY, null, path).data();
+        StringBuilder hex = new StringBuilder();
+        for (int i = 1; i < 33; i++) {
+            hex.append(String.format("%02x", compressed[i]));
+        }
+        return hex.toString();
+    }
+
+    /** Host-reachable URL of the primary relay. */
+    private static String relayUrl() {
+        return "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
+    }
+
+    /** Host-reachable URL of the second relay. */
+    private static String relay2Url() {
+        return "ws://" + relay2.getHost() + ":" + relay2.getMappedPort(7777);
+    }
+
+    /** Write a descriptor pointing at a specific relay. */
+    private static Path writeDescriptorOn(String filename, String service,
+            String loginXpub, String relayUrl) throws Exception {
+        String descriptorJson = String.format(
+                "{\"relay\":\"%s\",\"login_xpub\":\"%s\",\"services\":[\"%s\"]}",
+                relayUrl, loginXpub, service);
+        Path file = kvHome.resolve(filename);
+        Files.writeString(file, descriptorJson);
+        return file;
+    }
+
+    /**
+     * "Create a new realm" — the first outcome of a QR scan.
+     *
+     * @param identities optional extra selection rows, each an identity string
+     *                   or an object with an identity and protocol names
+     */
+    private static JsonObject attachNewRealm(String descriptorPath, String identity,
+            String realmName, JsonArray identities) {
+        JsonObject params = new JsonObject();
+        params.addProperty("descriptor", descriptorPath);
+        params.addProperty("identity", identity);
+        params.addProperty("policy", "auto");
+        if (realmName != null) {
+            params.addProperty("realm_name", realmName);
+        }
+        if (identities != null) {
+            params.add("identities", identities);
+        }
+        JsonObject result = daemonController.handle("session.attach", params);
+        assertFalse(result.has("error"), "session.attach failed: " + result);
+        return result;
+    }
+
+    /** "Connect to an existing realm" — the other outcome of a QR scan. */
+    private static JsonObject attachJoiningRealm(String descriptorPath, int realmId) {
+        JsonObject params = new JsonObject();
+        params.addProperty("descriptor", descriptorPath);
+        params.addProperty("realm_id", realmId);
+        JsonObject result = daemonController.handle("session.attach", params);
+        assertFalse(result.has("error"), "session.attach (join) failed: " + result);
+        return result;
+    }
+
+    private static JsonObject status() {
+        JsonObject result = daemonController.handle("session.status", new JsonObject());
+        assertFalse(result.has("error"), "session.status failed: " + result);
+        return result;
+    }
+
+    private static void detachConnector(int realmId, int connectorId) {
+        JsonObject params = new JsonObject();
+        params.addProperty("realm_id", realmId);
+        params.addProperty("connector_id", connectorId);
+        assertFalse(daemonController.handle("session.detach", params).has("error"));
+    }
+
+    private static void detachRealm(int realmId) {
+        JsonObject params = new JsonObject();
+        params.addProperty("realm_id", realmId);
+        assertFalse(daemonController.handle("session.detach", params).has("error"));
+    }
+
+    private static void detachAll() {
+        daemonController.handle("session.detach", new JsonObject());
+    }
+
+    /** The key blobs {@code ssh-add -L} lists, as a set, for comparing avatars. */
+    private static java.util.Set<String> sshFingerprints(GenericContainer<?> container)
+            throws Exception {
+        var result = container.execInContainer("ssh-add", "-L");
+        return result.getStdout().lines()
+                .filter(line -> line.startsWith("ssh-"))
+                .map(line -> line.split(" ")[1])
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
     /**
      * Attach to an avatar via direct controller call.
      */
@@ -1172,6 +1595,8 @@ class KeyMasterAvatarTest {
 
     @AfterAll
     static void tearDown() {
+        if (avatarOnRelay2 != null) avatarOnRelay2.stop();
+        if (relay2 != null) relay2.stop();
         if (avatarPackaged != null) avatarPackaged.stop();
         if (avatar != null) avatar.stop();
         if (sshd != null) sshd.stop();
