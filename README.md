@@ -26,8 +26,8 @@ those first — see the build order in
 The versions it builds against are pinned in `pom.xml`:
 
 ```xml
-<keymaster.version>0.7.2</keymaster.version>
-<keyvault.version>0.3.0</keyvault.version>
+<keymaster.version>0.7.3</keymaster.version>
+<keyvault.version>0.4.0</keyvault.version>
 ```
 
 Bump those pins when a new keymaster or keyvault is released, or this
