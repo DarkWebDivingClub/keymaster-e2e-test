@@ -39,7 +39,19 @@ suite silently keeps testing an older one.
 mvn test
 ```
 
-Expect `Tests run: 20` from `KeyMasterAvatarTest` and a build that takes
+The avatar image is built from locally built `keymaster-avatar`
+binaries. Point the suite at them with system properties (the defaults
+are a developer's paths):
+
+```sh
+AV=~/git/keymaster-avatar/target/release
+mvn test -Davatar.binary=$AV/keymaster-avatar \
+  -Dssh.avatar.binary=$AV/km-ssh-sa -Dgpg.avatar.binary=$AV/km-gpg-sa \
+  -Dnostr.avatar.binary=$AV/km-nostr-sa -Dx509.avatar.binary=$AV/km-x509-sa \
+  -Dscd.shim.binary=$AV/scd-shim
+```
+
+Expect `Tests run: 25` from `KeyMasterAvatarTest` and a build that takes
 roughly four minutes, most of it spent building container images.
 
 ### The LXC system test

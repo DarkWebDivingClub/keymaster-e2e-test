@@ -28,6 +28,10 @@ fi
 (while true; do km-ssh-sa --log-level debug || true; sleep 1; done) &
 (while true; do km-gpg-sa --log-level debug || true; sleep 1; done) &
 (while true; do km-nostr-sa --log-level debug || true; sleep 1; done) &
+# km-x509-sa has no /tmp fallback for its client socket and XDG_RUNTIME_DIR is
+# unset here, so --listen-socket is required; the tests talk to this path.
+(while true; do km-x509-sa --avatar-socket /tmp/keymaster-avatar.sock \
+    --listen-socket /tmp/keymaster-x509-sa.sock --log-level debug || true; sleep 1; done) &
 
 echo "Avatar PID=$AVATAR_PID, SAs started"
 
