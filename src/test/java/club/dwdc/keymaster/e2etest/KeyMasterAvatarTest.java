@@ -30,6 +30,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import nostr.crypto.nip44.EncryptedPayloads;
 import nostr.util.NostrUtil;
+import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1Integer;
+import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.ec.CustomNamedCurves;
 import org.bouncycastle.math.ec.ECPoint;
@@ -44,9 +47,20 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.AlgorithmParameters;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.Security;
+import java.security.Signature;
+import java.security.spec.ECGenParameterSpec;
+import java.security.spec.ECParameterSpec;
+import java.security.spec.ECPublicKeySpec;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -90,6 +104,10 @@ class KeyMasterAvatarTest {
     private static final String NOSTR_AVATAR_BINARY = System.getProperty(
             "nostr.avatar.binary",
             "/home/rene/git/keymaster-avatar/target/release/km-nostr-sa");
+
+    private static final String X509_AVATAR_BINARY = System.getProperty(
+            "x509.avatar.binary",
+            "/home/rene/git/keymaster-avatar/target/release/km-x509-sa");
 
     private static final String SCD_SHIM_BINARY = System.getProperty(
             "scd.shim.binary",
@@ -195,6 +213,7 @@ class KeyMasterAvatarTest {
                 .withFileFromPath("km-ssh-sa", Path.of(SSH_AVATAR_BINARY))
                 .withFileFromPath("km-gpg-sa", Path.of(GPG_AVATAR_BINARY))
                 .withFileFromPath("km-nostr-sa", Path.of(NOSTR_AVATAR_BINARY))
+                .withFileFromPath("km-x509-sa", Path.of(X509_AVATAR_BINARY))
                 .withFileFromPath("scd-shim", Path.of(SCD_SHIM_BINARY))
                 .withFileFromPath("entrypoint.sh", Path.of("docker/avatar/entrypoint.sh"));
 
@@ -1407,6 +1426,332 @@ class KeyMasterAvatarTest {
             detachViaController();
             Thread.sleep(500);
         }
+    }
+
+    // ==================== X.509 service avatar tests ====================
+    // km-x509-sa speaks newline-delimited JSON-RPC on its own socket (list,
+    // sign, import), validates locally, and forwards to KeyMaster's x509
+    // channel through the avatar local API. Each test attaches on its own and
+    // polls for readiness instead of sleeping a fixed time.
+
+    private static final String X509_SA_SOCK = "/tmp/keymaster-x509-sa.sock";
+    private static final String AVATAR_API_SOCK = "/tmp/keymaster-avatar.sock";
+
+    /** Alice's TLS-client key, as KeyMaster derives and labels it. */
+    private static final String ALICE_TLS_PATH = "m/44'/1240'/1955269225'/196866'/0'";
+    private static final String ALICE_TLS_LABEL = "alice@atlanta.com tls-client";
+    private static final String ALICE_TLS_PUB_HEX =
+            "04b99b60d501f8c4410839779fbea199d87b83dd675ffba53223529adfd0f05a"
+            + "c83c199adda4b7b7aaad50afd3ed4b230361e6ce56ea78790707cb7d84a81a2a81";
+
+    private static final String X509_LIST = rpc(1, "list", new JsonObject());
+    private static final byte[] X509_MESSAGE =
+            "keymaster x509 e2e".getBytes(StandardCharsets.UTF_8);
+
+    @Test
+    @Order(70)
+    void x509ListServesAliceTlsClientKey() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-list.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject response = awaitX509Result(X509_LIST, 20_000);
+            log.info("x509 list: {}", response);
+            JsonObject key = onlyX509Key(response);
+
+            assertEquals(ALICE_TLS_PATH, key.get("path").getAsString());
+            assertEquals(ALICE_TLS_LABEL, key.get("label").getAsString());
+
+            byte[] publicKey = base64Field(key, "public_key");
+            assertEquals(65, publicKey.length, "uncompressed P-256 point");
+            assertEquals(0x04, publicKey[0], "uncompressed point prefix");
+            assertEquals(ALICE_TLS_PUB_HEX, HexFormat.of().formatHex(publicKey));
+
+            assertEquals(32, base64Field(key, "id").length, "id is a SHA-256");
+            assertFalse(key.has("cert"), "no certificate imported yet: " + key);
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(71)
+    void x509SignVerifiesWithListedKey() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-sign.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            byte[] publicKey = base64Field(key, "public_key");
+
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(X509_MESSAGE);
+            JsonObject response = x509Sa(x509SignRequest(key.get("path").getAsString(), digest));
+            log.info("x509 sign: {}", response);
+            assertNotNull(response.get("result"), "sign should have a result: " + response);
+
+            byte[] signature = base64Field(response.getAsJsonObject("result"), "signature");
+            assertEquals(64, signature.length, "raw r||s");
+            assertTrue(verifyP256(publicKey, X509_MESSAGE, signature),
+                    "signature must verify as SHA256withECDSA over the message");
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(72)
+    void x509SaRespawnsOnCrash() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-respawn.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            byte[] publicKey = base64Field(key, "public_key");
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(X509_MESSAGE);
+            String signRequest = x509SignRequest(ALICE_TLS_PATH, digest);
+
+            // Baseline: signing works before the crash
+            assertNotNull(x509Sa(signRequest).get("result"), "sign should work before kill");
+
+            String oldPid = x509SaPid();
+            assertFalse(oldPid.isEmpty(), "km-x509-sa should be running");
+
+            // -x: match the process name exactly, not the bash restart loop
+            var killResult = avatar.execInContainer("pkill", "-x", "km-x509-sa");
+            assertEquals(0, killResult.getExitCode(), "pkill should find km-x509-sa");
+
+            // The restart loop sleeps 1 s before relaunching; wait for a new PID
+            String newPid = "";
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline) {
+                newPid = x509SaPid();
+                if (!newPid.isEmpty() && !newPid.equals(oldPid)) {
+                    break;
+                }
+                Thread.sleep(250);
+            }
+            log.info("km-x509-sa pid before={} after={}", oldPid, newPid);
+            assertTrue(!newPid.isEmpty() && !newPid.equals(oldPid),
+                    "km-x509-sa should come back as a new process (old " + oldPid + ")");
+
+            // The new process rebinds its socket and reconnects to the avatar
+            JsonObject response = awaitX509Result(signRequest, 15_000);
+            byte[] signature = base64Field(response.getAsJsonObject("result"), "signature");
+            assertTrue(verifyP256(publicKey, X509_MESSAGE, signature),
+                    "signature after respawn must verify");
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(73)
+    void x509ChannelRejectsForeignMethods() throws Exception {
+        // gpg is attached too, so a request misrouted to the gpg handler
+        // would reach a handler that really has sign_request.
+        Path descriptorFile = writeDescriptorOn("descriptor-x509-isolation.json",
+                "gpg\",\"x509", avatarLoginXpub, relayUrl());
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            awaitX509Result(X509_LIST, 20_000);
+
+            JsonObject connectParams = new JsonObject();
+            connectParams.addProperty("type", "x509");
+            String gpgSign = rpc(2, "gpg.sign_request", new JsonObject());
+
+            // Straight to the avatar local API, bypassing km-x509-sa's allowlist
+            List<JsonObject> replies = lineRpc(avatar, AVATAR_API_SOCK,
+                    rpc(1, "connect", connectParams), gpgSign);
+            log.info("avatar API replies: {}", replies);
+            assertFalse(replies.get(0).has("error"), "connect should succeed: " + replies.get(0));
+
+            JsonObject channelReply = replies.get(1);
+            assertFalse(channelReply.has("result"),
+                    "the x509 channel must not serve a gpg method: " + channelReply);
+            JsonObject channelError = channelReply.getAsJsonObject("error");
+            assertNotNull(channelError, "expected an error: " + channelReply);
+            assertEquals(-32603, channelError.get("code").getAsInt(), channelReply.toString());
+            String message = channelError.get("message").getAsString();
+            assertTrue(message.contains("unknown method") && message.contains("gpg.sign_request"),
+                    "KeyMaster's x509 handler should not know the method: " + message);
+
+            // Through km-x509-sa: rejected locally (-32601), never forwarded
+            // (a forwarded call would have come back as KeyMaster's -32603)
+            JsonObject saReply = x509Sa(gpgSign);
+            log.info("km-x509-sa reply: {}", saReply);
+            assertFalse(saReply.has("result"), saReply.toString());
+            assertEquals(-32601, saReply.getAsJsonObject("error").get("code").getAsInt(),
+                    saReply.toString());
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(74)
+    void x509SignRejectsShortDigest() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-short-digest.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            awaitX509Result(X509_LIST, 20_000);
+
+            // Attached, so a forwarded request would get KeyMaster's
+            // -32603 "invalid-digest"; -32602 proves the SA rejected it.
+            JsonObject response = x509Sa(x509SignRequest(ALICE_TLS_PATH, new byte[31]));
+            log.info("x509 sign (31-byte digest): {}", response);
+            assertFalse(response.has("result"), response.toString());
+            assertEquals(-32602, response.getAsJsonObject("error").get("code").getAsInt(),
+                    response.toString());
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    // ==================== X.509 helpers ====================
+
+    /** A JSON-RPC 2.0 request line. */
+    private static String rpc(int id, String method, JsonObject params) {
+        JsonObject request = new JsonObject();
+        request.addProperty("jsonrpc", "2.0");
+        request.addProperty("id", id);
+        request.addProperty("method", method);
+        request.add("params", params);
+        return request.toString();
+    }
+
+    private static String x509SignRequest(String path, byte[] digest) {
+        JsonObject params = new JsonObject();
+        params.addProperty("path", path);
+        params.addProperty("digest", Base64.getEncoder().encodeToString(digest));
+        return rpc(2, "sign", params);
+    }
+
+    /** The single key in a list result; fails if there isn't exactly one. */
+    private static JsonObject onlyX509Key(JsonObject listResponse) {
+        JsonArray keys = listResponse.getAsJsonObject("result").getAsJsonArray("keys");
+        assertEquals(1, keys.size(), "exactly Alice's TLS-client key: " + listResponse);
+        return keys.get(0).getAsJsonObject();
+    }
+
+    private static byte[] base64Field(JsonObject object, String field) {
+        assertTrue(object.has(field), "missing '" + field + "': " + object);
+        return Base64.getDecoder().decode(object.get(field).getAsString());
+    }
+
+    /** PID(s) of km-x509-sa in the avatar container, or "" if none. */
+    private static String x509SaPid() throws Exception {
+        return avatar.execInContainer("pgrep", "-x", "km-x509-sa").getStdout().trim();
+    }
+
+    /**
+     * Send one request to km-x509-sa, retrying every 500 ms until the reply
+     * has a result. Covers both "session not up yet" (error reply) and "SA
+     * socket not bound yet" (connection failure).
+     */
+    private static JsonObject awaitX509Result(String request, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        String last = "no attempt";
+        while (true) {
+            try {
+                JsonObject response = x509Sa(request);
+                if (response.has("result")) {
+                    return response;
+                }
+                last = response.toString();
+            } catch (RuntimeException e) {
+                last = e.getMessage();
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                fail("km-x509-sa gave no result within " + timeoutMs + " ms; last: " + last);
+            }
+            Thread.sleep(500);
+        }
+    }
+
+    private static JsonObject x509Sa(String request) throws Exception {
+        return lineRpc(avatar, X509_SA_SOCK, request).get(0);
+    }
+
+    /**
+     * Send newline-delimited JSON-RPC requests over ONE connection to a unix
+     * socket in the container, reading one reply line per request. One
+     * connection matters for the avatar local API, where "connect" binds it.
+     *
+     * <p>The 40 s socket timeout is above km-x509-sa's 35 s request timeout,
+     * which is above the avatar's 30 s Nostr timeout, so the real error
+     * always arrives before Python gives up.
+     */
+    private static List<JsonObject> lineRpc(GenericContainer<?> container, String socketPath,
+            String... requests) throws Exception {
+        String script = String.join("\n",
+                "import socket,sys",
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)",
+                "s.settimeout(40)",
+                "s.connect(sys.argv[1])",
+                "f=s.makefile('rwb')",
+                "for req in sys.argv[2:]:",
+                "  f.write(req.encode()+b'\\n')",
+                "  f.flush()",
+                "  line=f.readline()",
+                "  if not line: raise Exception('EOF')",
+                "  print(line.decode().strip())",
+                "s.close()");
+        String[] command = new String[4 + requests.length];
+        command[0] = "python3";
+        command[1] = "-c";
+        command[2] = script;
+        command[3] = socketPath;
+        System.arraycopy(requests, 0, command, 4, requests.length);
+
+        var result = container.execInContainer(command);
+        if (result.getExitCode() != 0) {
+            throw new RuntimeException("request to " + socketPath + " failed (exit="
+                    + result.getExitCode() + "): " + result.getStderr());
+        }
+        List<JsonObject> replies = result.getStdout().lines()
+                .filter(line -> !line.isBlank())
+                .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                .toList();
+        if (replies.size() != requests.length) {
+            throw new RuntimeException("expected " + requests.length + " replies, got: "
+                    + result.getStdout());
+        }
+        return replies;
+    }
+
+    /**
+     * Verify a raw r||s P-256 signature over {@code message} with
+     * SHA256withECDSA. Java's verifier wants DER, so r and s are wrapped in
+     * an ASN.1 SEQUENCE of two INTEGERs first.
+     */
+    private static boolean verifyP256(byte[] uncompressedPoint, byte[] message, byte[] rawSignature)
+            throws Exception {
+        AlgorithmParameters parameters = AlgorithmParameters.getInstance("EC", "SunEC");
+        parameters.init(new ECGenParameterSpec("secp256r1"));
+        ECParameterSpec curve = parameters.getParameterSpec(ECParameterSpec.class);
+
+        java.security.spec.ECPoint point = new java.security.spec.ECPoint(
+                new BigInteger(1, Arrays.copyOfRange(uncompressedPoint, 1, 33)),
+                new BigInteger(1, Arrays.copyOfRange(uncompressedPoint, 33, 65)));
+        PublicKey publicKey = KeyFactory.getInstance("EC", "SunEC")
+                .generatePublic(new ECPublicKeySpec(point, curve));
+
+        BigInteger r = new BigInteger(1, Arrays.copyOfRange(rawSignature, 0, 32));
+        BigInteger s = new BigInteger(1, Arrays.copyOfRange(rawSignature, 32, 64));
+        byte[] der = new DERSequence(new ASN1Encodable[] {
+                new ASN1Integer(r), new ASN1Integer(s)}).getEncoded();
+
+        Signature verifier = Signature.getInstance("SHA256withECDSA", "SunEC");
+        verifier.initVerify(publicKey);
+        verifier.update(message);
+        return verifier.verify(der);
     }
 
     // ==================== Helpers ====================
