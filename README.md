@@ -48,6 +48,7 @@ AV=~/git/keymaster-avatar/target/release
 mvn test -Davatar.binary=$AV/keymaster-avatar \
   -Dssh.avatar.binary=$AV/km-ssh-sa -Dgpg.avatar.binary=$AV/km-gpg-sa \
   -Dnostr.avatar.binary=$AV/km-nostr-sa -Dx509.avatar.binary=$AV/km-x509-sa \
+  -Dpkcs11.x509.module=$AV/libkm_pkcs11_x509.so \
   -Dscd.shim.binary=$AV/scd-shim
 ```
 
