@@ -1,6 +1,7 @@
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client gnupg procps python3-minimal gnutls-bin p11-kit opensc openssl \
+    openvpn pkcs11-provider iproute2 iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 COPY keymaster-avatar /usr/local/bin/keymaster-avatar
 COPY km-ssh-sa /usr/local/bin/km-ssh-sa
