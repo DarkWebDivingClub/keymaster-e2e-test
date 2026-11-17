@@ -30,6 +30,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import nostr.crypto.nip44.EncryptedPayloads;
 import nostr.util.NostrUtil;
+import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1Integer;
+import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.ec.CustomNamedCurves;
 import org.bouncycastle.math.ec.ECPoint;
@@ -44,9 +47,22 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.AlgorithmParameters;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.Security;
+import java.security.Signature;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.spec.ECGenParameterSpec;
+import java.security.spec.ECParameterSpec;
+import java.security.spec.ECPublicKeySpec;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -90,6 +106,13 @@ class KeyMasterAvatarTest {
     private static final String NOSTR_AVATAR_BINARY = System.getProperty(
             "nostr.avatar.binary",
             "/home/rene/git/keymaster-avatar/target/release/km-nostr-sa");
+
+    private static final String X509_AVATAR_BINARY = System.getProperty(
+            "x509.avatar.binary",
+            "/home/rene/git/keymaster-avatar/target/release/km-x509-sa");
+
+    /** Required, no default: -Dpkcs11.x509.module=<path to libkm_pkcs11_x509.so>. */
+    private static final String PKCS11_X509_MODULE = System.getProperty("pkcs11.x509.module");
 
     private static final String SCD_SHIM_BINARY = System.getProperty(
             "scd.shim.binary",
@@ -188,6 +211,12 @@ class KeyMasterAvatarTest {
         sshd.start();
         log.info("SSHD container started on port {}", sshd.getMappedPort(22));
 
+        // The PKCS#11 tests need the module: fail loudly, never skip.
+        if (PKCS11_X509_MODULE == null || !Files.isRegularFile(Path.of(PKCS11_X509_MODULE))) {
+            throw new IllegalStateException("-Dpkcs11.x509.module must name libkm_pkcs11_x509.so, got: "
+                    + PKCS11_X509_MODULE);
+        }
+
         // Build avatar image
         ImageFromDockerfile avatarImage = new ImageFromDockerfile()
                 .withFileFromPath("Dockerfile", Path.of("docker/avatar/Dockerfile"))
@@ -195,6 +224,8 @@ class KeyMasterAvatarTest {
                 .withFileFromPath("km-ssh-sa", Path.of(SSH_AVATAR_BINARY))
                 .withFileFromPath("km-gpg-sa", Path.of(GPG_AVATAR_BINARY))
                 .withFileFromPath("km-nostr-sa", Path.of(NOSTR_AVATAR_BINARY))
+                .withFileFromPath("km-x509-sa", Path.of(X509_AVATAR_BINARY))
+                .withFileFromPath("libkm_pkcs11_x509.so", Path.of(PKCS11_X509_MODULE))
                 .withFileFromPath("scd-shim", Path.of(SCD_SHIM_BINARY))
                 .withFileFromPath("entrypoint.sh", Path.of("docker/avatar/entrypoint.sh"));
 
@@ -1407,6 +1438,683 @@ class KeyMasterAvatarTest {
             detachViaController();
             Thread.sleep(500);
         }
+    }
+
+    // ==================== X.509 service avatar tests ====================
+    // km-x509-sa speaks newline-delimited JSON-RPC on its own socket (list,
+    // sign, import), validates locally, and forwards to KeyMaster's x509
+    // channel through the avatar local API. Each test attaches on its own and
+    // polls for readiness instead of sleeping a fixed time.
+
+    private static final String X509_SA_SOCK = "/tmp/keymaster-x509-sa.sock";
+    private static final String AVATAR_API_SOCK = "/tmp/keymaster-avatar.sock";
+
+    /** Alice's TLS-client key, as KeyMaster derives and labels it. */
+    private static final String ALICE_TLS_PATH = "m/44'/1240'/1955269225'/196866'/0'";
+    private static final String ALICE_TLS_LABEL = "alice@atlanta.com tls-client";
+    private static final String ALICE_TLS_PUB_HEX =
+            "04b99b60d501f8c4410839779fbea199d87b83dd675ffba53223529adfd0f05a"
+            + "c83c199adda4b7b7aaad50afd3ed4b230361e6ce56ea78790707cb7d84a81a2a81";
+
+    private static final String X509_LIST = rpc(1, "list", new JsonObject());
+    private static final byte[] X509_MESSAGE =
+            "keymaster x509 e2e".getBytes(StandardCharsets.UTF_8);
+
+    @Test
+    @Order(70)
+    void x509ListServesAliceTlsClientKey() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-list.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject response = awaitX509Result(X509_LIST, 20_000);
+            log.info("x509 list: {}", response);
+            JsonObject key = onlyX509Key(response);
+
+            assertEquals(ALICE_TLS_PATH, key.get("path").getAsString());
+            assertEquals(ALICE_TLS_LABEL, key.get("label").getAsString());
+
+            byte[] publicKey = base64Field(key, "public_key");
+            assertEquals(65, publicKey.length, "uncompressed P-256 point");
+            assertEquals(0x04, publicKey[0], "uncompressed point prefix");
+            assertEquals(ALICE_TLS_PUB_HEX, HexFormat.of().formatHex(publicKey));
+
+            assertEquals(32, base64Field(key, "id").length, "id is a SHA-256");
+            assertFalse(key.has("cert"), "no certificate imported yet: " + key);
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(71)
+    void x509SignVerifiesWithListedKey() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-sign.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            byte[] publicKey = base64Field(key, "public_key");
+
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(X509_MESSAGE);
+            JsonObject response = x509Sa(x509SignRequest(key.get("path").getAsString(), digest));
+            log.info("x509 sign: {}", response);
+            assertNotNull(response.get("result"), "sign should have a result: " + response);
+
+            byte[] signature = base64Field(response.getAsJsonObject("result"), "signature");
+            assertEquals(64, signature.length, "raw r||s");
+            assertTrue(verifyP256(publicKey, X509_MESSAGE, signature),
+                    "signature must verify as SHA256withECDSA over the message");
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(72)
+    void x509SaRespawnsOnCrash() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-respawn.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            byte[] publicKey = base64Field(key, "public_key");
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(X509_MESSAGE);
+            String signRequest = x509SignRequest(ALICE_TLS_PATH, digest);
+
+            // Baseline: signing works before the crash
+            assertNotNull(x509Sa(signRequest).get("result"), "sign should work before kill");
+
+            String oldPid = x509SaPid();
+            assertFalse(oldPid.isEmpty(), "km-x509-sa should be running");
+
+            // -x: match the process name exactly, not the bash restart loop
+            var killResult = avatar.execInContainer("pkill", "-x", "km-x509-sa");
+            assertEquals(0, killResult.getExitCode(), "pkill should find km-x509-sa");
+
+            // The restart loop sleeps 1 s before relaunching; wait for a new PID
+            String newPid = "";
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline) {
+                newPid = x509SaPid();
+                if (!newPid.isEmpty() && !newPid.equals(oldPid)) {
+                    break;
+                }
+                Thread.sleep(250);
+            }
+            log.info("km-x509-sa pid before={} after={}", oldPid, newPid);
+            assertTrue(!newPid.isEmpty() && !newPid.equals(oldPid),
+                    "km-x509-sa should come back as a new process (old " + oldPid + ")");
+
+            // The new process rebinds its socket and reconnects to the avatar
+            JsonObject response = awaitX509Result(signRequest, 15_000);
+            byte[] signature = base64Field(response.getAsJsonObject("result"), "signature");
+            assertTrue(verifyP256(publicKey, X509_MESSAGE, signature),
+                    "signature after respawn must verify");
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(73)
+    void x509ChannelRejectsForeignMethods() throws Exception {
+        // gpg is attached too, so a request misrouted to the gpg handler
+        // would reach a handler that really has sign_request.
+        Path descriptorFile = writeDescriptorOn("descriptor-x509-isolation.json",
+                "gpg\",\"x509", avatarLoginXpub, relayUrl());
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            awaitX509Result(X509_LIST, 20_000);
+
+            JsonObject connectParams = new JsonObject();
+            connectParams.addProperty("type", "x509");
+            String gpgSign = rpc(2, "gpg.sign_request", new JsonObject());
+
+            // Straight to the avatar local API, bypassing km-x509-sa's allowlist
+            List<JsonObject> replies = lineRpc(avatar, AVATAR_API_SOCK,
+                    rpc(1, "connect", connectParams), gpgSign);
+            log.info("avatar API replies: {}", replies);
+            assertFalse(replies.get(0).has("error"), "connect should succeed: " + replies.get(0));
+
+            JsonObject channelReply = replies.get(1);
+            assertFalse(channelReply.has("result"),
+                    "the x509 channel must not serve a gpg method: " + channelReply);
+            JsonObject channelError = channelReply.getAsJsonObject("error");
+            assertNotNull(channelError, "expected an error: " + channelReply);
+            assertEquals(-32603, channelError.get("code").getAsInt(), channelReply.toString());
+            String message = channelError.get("message").getAsString();
+            assertTrue(message.contains("unknown method") && message.contains("gpg.sign_request"),
+                    "KeyMaster's x509 handler should not know the method: " + message);
+
+            // Through km-x509-sa: rejected locally (-32601), never forwarded
+            // (a forwarded call would have come back as KeyMaster's -32603)
+            JsonObject saReply = x509Sa(gpgSign);
+            log.info("km-x509-sa reply: {}", saReply);
+            assertFalse(saReply.has("result"), saReply.toString());
+            assertEquals(-32601, saReply.getAsJsonObject("error").get("code").getAsInt(),
+                    saReply.toString());
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(74)
+    void x509SignRejectsShortDigest() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-x509-short-digest.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            awaitX509Result(X509_LIST, 20_000);
+
+            // Attached, so a forwarded request would get KeyMaster's
+            // -32603 "invalid-digest"; -32602 proves the SA rejected it.
+            JsonObject response = x509Sa(x509SignRequest(ALICE_TLS_PATH, new byte[31]));
+            log.info("x509 sign (31-byte digest): {}", response);
+            assertFalse(response.has("result"), response.toString());
+            assertEquals(-32602, response.getAsJsonObject("error").get("code").getAsInt(),
+                    response.toString());
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    // ==================== X.509 through PKCS#11 (km_pkcs11_x509) ====================
+    //
+    // Order: listing/ID (75) → token strings/modules (76) → no certificate (77)
+    // → mechanisms (78) → CSR (79) → key template rejected (80) → import (81)
+    // → foreign certificate (82) → no channel (83).
+    //
+    // GnuTLS loads keys only from object URLs (id=/object=), taken from
+    // `p11tool --list-all --only-urls` (p11tool 3.8 has no --list-all-pubkeys).
+
+    /** The module's token, as p11tool addresses it. */
+    private static final String P11_TOKEN = "pkcs11:token=KeyMaster%20X.509";
+    private static final String P11_TOKEN_LABEL = "KeyMaster X.509";
+    /** Where the image installs the module (the package path). */
+    private static final String P11_MODULE_PATH = "/usr/lib/keymaster-avatar/lib/libkm_pkcs11_x509.so";
+    /** DER SubjectPublicKeyInfo header for an uncompressed P-256 point. */
+    private static final String P256_SPKI_PREFIX_HEX =
+            "3059301306072a8648ce3d020106082a8648ce3d030107034200";
+    private static final String CERT_TEMPLATE =
+            "cn = \"alice@atlanta.com\"\nserial = 7\nexpiration_days = 30\ntls_www_client\nsigning_key\n";
+
+    @Test
+    @Order(75)
+    void pkcs11ListsAliceKey() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-list.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            var list = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
+
+            assertEquals(2, objectCount(list), "private + public key, no certificate yet\n" + out(list));
+            assertTrue(list.getStdout().contains(ALICE_TLS_LABEL), out(list));
+            String listedId = HexFormat.ofDelimiter(":").formatHex(base64Field(key, "id"));
+            assertEquals(aliceIdColonHex(), listedId, "list id = SHA-256 of Alice's SPKI");
+            assertEquals(List.of(listedId, listedId), p11Ids(list.getStdout()),
+                    "both objects carry CKA_ID = the list id\n" + out(list));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(76)
+    void pkcs11TokenStringsAndModuleRegistration() throws Exception {
+        requirePkcs11Module();
+        // No channel needed: module and token information never touch the socket.
+        var modules = p11Ok("p11-kit", "list-modules");
+        String section = moduleSection(modules.getStdout(), "keymaster");
+        assertNotNull(section, "p11-kit list-modules has no 'module: keymaster'\n" + out(modules));
+        assertTrue(section.contains("path: " + P11_MODULE_PATH), section);
+        assertTrue(section.contains("token: " + P11_TOKEN_LABEL), section);
+
+        var tokens = p11Ok("p11tool", "--list-tokens");
+        String token = tokenBlock(tokens.getStdout(), P11_TOKEN_LABEL);
+        assertNotNull(token, "p11tool --list-tokens has no '" + P11_TOKEN_LABEL + "'\n" + out(tokens));
+        assertTrue(token.contains("Manufacturer: DWDC"), token);
+        assertTrue(token.contains("Model: KeyMaster"), token);
+        assertTrue(token.contains("Serial: 0000000000000001"), token);
+    }
+
+    @Test
+    @Order(77)
+    void pkcs11NoCertificateBeforeImport() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-nocert.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            assertFalse(key.has("cert"), "KeyMaster holds no certificate yet: " + key);
+            // The channel works (two objects), so an empty certificate search is real.
+            assertEquals(2, objectCount(p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN)));
+
+            var certs = p11("p11tool", "--batch", "--list-all-certs", P11_TOKEN);
+            boolean emptyOk = certs.getExitCode() == 0 && objectCount(certs) == 0;
+            // p11tool's convention for an empty search: non-zero exit and this message.
+            boolean emptyByConvention = certs.getExitCode() != 0 && objectCount(certs) == 0
+                    && out(certs).contains("No matching objects found");
+            assertTrue(emptyOk || emptyByConvention, "expected no certificate\n" + out(certs));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(78)
+    void pkcs11MechanismsListEcdsa() throws Exception {
+        requirePkcs11Module();
+        var mechs = p11Ok("pkcs11-tool", "--module", P11_MODULE_PATH, "-M");
+        assertTrue(mechs.getStdout().contains("ECDSA"), "CKM_ECDSA expected\n" + out(mechs));
+    }
+
+    @Test
+    @Order(79)
+    void pkcs11CsrMatchesListedKey() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-csr.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            writeCertTemplate();
+            p11Ok("certtool", "--generate-request",
+                    "--load-privkey", p11ObjectUrl("private"), "--load-pubkey", p11ObjectUrl("public"),
+                    "--template", "/tmp/p11-tmpl", "--outfile", "/tmp/alice-p11.csr");
+            // The CSR's self-signature, made through the token, verifies.
+            p11Ok("openssl", "req", "-in", "/tmp/alice-p11.csr", "-verify", "-noout");
+
+            var pub = p11Ok("openssl", "req", "-in", "/tmp/alice-p11.csr", "-pubkey", "-noout");
+            byte[] csrSpkiHash = MessageDigest.getInstance("SHA-256").digest(pemBody(pub.getStdout()));
+            byte[] listedId = base64Field(key, "id");
+            assertArrayEquals(listedId, csrSpkiHash, "CSR SPKI sha256 == list id\n" + out(pub));
+
+            var list = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
+            String colon = HexFormat.ofDelimiter(":").formatHex(csrSpkiHash);
+            assertEquals(List.of(colon, colon), p11Ids(list.getStdout()),
+                    "CSR SPKI sha256 == CKA_ID\n" + out(list));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(80)
+    void pkcs11KeyTemplateRejected() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-keywrite.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            awaitX509Result(X509_LIST, 20_000);
+            p11Ok("openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-out", "/tmp/p11-fresh.key");
+            assertEquals(2, objectCount(p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN)));
+
+            var write = p11("pkcs11-tool", "--module", P11_MODULE_PATH,
+                    "--write-object", "/tmp/p11-fresh.key", "--type", "privkey");
+            assertNotEquals(0, write.getExitCode(), "a private key must not be created\n" + out(write));
+            assertTrue(out(write).contains("CKR_TEMPLATE_INCONSISTENT"),
+                    "refused by C_CreateObject, not earlier\n" + out(write));
+
+            var after = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
+            assertEquals(2, objectCount(after), "object count unchanged\n" + out(after));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(81)
+    void pkcs11ImportsCertificate() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-import.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject key = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            X509Certificate cert = makeAliceCertViaToken("/tmp/alice-p11-import.pem");
+
+            // Desktop KeyMaster has a certificate store (KeyMasterController passes
+            // keyMetaDataStore; only Android passes null and answers "unsupported").
+            p11Ok("p11tool", "--batch", "--write", "--load-certificate",
+                    "/tmp/alice-p11-import.pem", "--label", "alice", P11_TOKEN);
+
+            JsonObject stored = onlyX509Key(x509Sa(X509_LIST));
+            assertArrayEquals(cert.getEncoded(), base64Field(stored, "cert"), "KeyMaster stored the certificate");
+
+            var list = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
+            assertEquals(3, objectCount(list), out(list));
+            String id = HexFormat.ofDelimiter(":").formatHex(base64Field(key, "id"));
+            assertEquals(List.of(id, id, id), p11Ids(list.getStdout()),
+                    "the certificate shares the keys' CKA_ID\n" + out(list));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(82)
+    void pkcs11ImportForeignCertRejected() throws Exception {
+        requirePkcs11Module();
+        Path descriptorFile = writeDescriptor("descriptor-p11-foreign.json", "x509");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            JsonObject before = onlyX509Key(awaitX509Result(X509_LIST, 20_000));
+            int objectsBefore = objectCount(p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN));
+
+            // A software key in the container, not Alice's.
+            writeCertTemplate();
+            p11Ok("certtool", "--generate-privkey", "--key-type", "ecdsa",
+                    "--curve", "secp256r1", "--outfile", "/tmp/foreign.key");
+            p11Ok("certtool", "--generate-self-signed", "--load-privkey", "/tmp/foreign.key",
+                    "--template", "/tmp/p11-tmpl", "--outfile", "/tmp/foreign.pem");
+
+            var write = p11("p11tool", "--batch", "--write", "--load-certificate",
+                    "/tmp/foreign.pem", "--label", "foreign", P11_TOKEN);
+            assertNotEquals(0, write.getExitCode(), "KEY_MISMATCH must fail the write\n" + out(write));
+
+            JsonObject after = onlyX509Key(x509Sa(X509_LIST));
+            assertEquals(before.get("cert"), after.get("cert"), "the stored certificate is unchanged");
+            var list = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
+            assertEquals(objectsBefore, objectCount(list), "object count unchanged\n" + out(list));
+        } finally {
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(83)
+    void pkcs11WithoutChannelIsDeviceError() throws Exception {
+        requirePkcs11Module();
+        // Nothing attached: km-x509-sa forwards, the avatar answers -32001.
+        var list = p11Debug("p11tool", "--batch", "--list-all", P11_TOKEN);
+        log.info("p11tool without a channel:\n{}", out(list));
+        assertEquals(0, objectCount(list), "no objects without a channel or a cache\n" + out(list));
+        assertTrue(list.getStderr().contains("list refresh failed") && list.getStderr().contains("-32001"),
+                "the module saw -32001 (mapped to CKR_DEVICE_ERROR)\n" + out(list));
+    }
+
+    /** The module was passed in and is installed in the image. Fails, never skips. */
+    private static void requirePkcs11Module() throws Exception {
+        assertNotNull(PKCS11_X509_MODULE, "-Dpkcs11.x509.module=<libkm_pkcs11_x509.so> is required");
+        p11Ok("test", "-f", P11_MODULE_PATH);
+    }
+
+    /** Run a command in the avatar container, pointed at the e2e km-x509-sa socket. */
+    private static org.testcontainers.containers.Container.ExecResult p11(String... command) throws Exception {
+        String[] full = new String[command.length + 2];
+        full[0] = "env";
+        full[1] = "X509_SA_SOCK=" + X509_SA_SOCK;
+        System.arraycopy(command, 0, full, 2, command.length);
+        var result = avatar.execInContainer(full);
+        log.info("$ {}\n{}", String.join(" ", command), out(result));
+        return result;
+    }
+
+    /** Same, and the command must exit 0; the message carries its output. */
+    private static org.testcontainers.containers.Container.ExecResult p11Ok(String... command) throws Exception {
+        var result = p11(command);
+        assertEquals(0, result.getExitCode(),
+                "command failed: " + String.join(" ", command) + "\n" + out(result));
+        return result;
+    }
+
+    /** Same as p11, with the module's diagnostics on stderr. */
+    private static org.testcontainers.containers.Container.ExecResult p11Debug(String... command) throws Exception {
+        String[] full = new String[command.length + 1];
+        full[0] = "KM_PKCS11_X509_DEBUG=1";
+        System.arraycopy(command, 0, full, 1, command.length);
+        return p11(full);
+    }
+
+    /** Exit code, stdout and stderr, for assertion messages. */
+    private static String out(org.testcontainers.containers.Container.ExecResult r) {
+        return "exit=" + r.getExitCode() + "\n--- stdout ---\n" + r.getStdout() + "--- stderr ---\n" + r.getStderr();
+    }
+
+    private static long objectCountOf(String listing) {
+        return listing.lines().filter(l -> l.startsWith("Object")).count();
+    }
+
+    private static int objectCount(org.testcontainers.containers.Container.ExecResult r) {
+        return (int) objectCountOf(r.getStdout());
+    }
+
+    /** The "ID:" values p11tool prints, in order. */
+    private static List<String> p11Ids(String listing) {
+        return listing.lines().map(String::trim).filter(l -> l.startsWith("ID:"))
+                .map(l -> l.substring(3).trim()).toList();
+    }
+
+    /** The one Alice object URL of the given type (private/public), from --list-all --only-urls. */
+    private static String p11ObjectUrl(String type) throws Exception {
+        var urls = p11Ok("p11tool", "--batch", "--list-all", "--only-urls", P11_TOKEN);
+        List<String> matches = urls.getStdout().lines().map(String::trim)
+                .filter(l -> l.contains("tls-client") && l.contains("type=" + type)).toList();
+        assertEquals(1, matches.size(), "exactly one " + type + " key URL\n" + out(urls));
+        return matches.get(0);
+    }
+
+    /** A module's block in `p11-kit list-modules` ("module: NAME" up to the next module), or null. */
+    private static String moduleSection(String listing, String name) {
+        StringBuilder section = null;
+        for (String line : listing.split("\n")) {
+            if (line.startsWith("module: ")) {
+                if (section != null) {
+                    break;
+                }
+                if (line.equals("module: " + name)) {
+                    section = new StringBuilder();
+                }
+            } else if (section != null) {
+                section.append(line.trim()).append('\n');
+            }
+        }
+        return section == null ? null : section.toString();
+    }
+
+    /** The `p11tool --list-tokens` block whose Label is {@code label}, or null. */
+    private static String tokenBlock(String listing, String label) {
+        for (String block : listing.split("\n(?=Token \\d+:)")) {
+            if (block.lines().map(String::trim).anyMatch(l -> l.equals("Label: " + label))) {
+                return block.lines().map(String::trim).reduce("", (a, b) -> a + b + "\n");
+            }
+        }
+        return null;
+    }
+
+    /** The DER inside a single PEM block. */
+    private static byte[] pemBody(String pem) {
+        String b64 = pem.lines().filter(l -> !l.startsWith("-----")).reduce("", String::concat);
+        return Base64.getDecoder().decode(b64);
+    }
+
+    /** SHA-256 of Alice's SPKI as p11tool prints IDs: aa:bb:cc:... */
+    private static String aliceIdColonHex() throws Exception {
+        byte[] spki = HexFormat.of().parseHex(P256_SPKI_PREFIX_HEX + ALICE_TLS_PUB_HEX);
+        byte[] id = MessageDigest.getInstance("SHA-256").digest(spki);
+        return HexFormat.ofDelimiter(":").formatHex(id);
+    }
+
+    private static void writeCertTemplate() throws Exception {
+        p11Ok("bash", "-c", "printf '" + CERT_TEMPLATE + "' > /tmp/p11-tmpl");
+    }
+
+    /**
+     * certtool makes a self-signed TLS-client certificate with the token's key.
+     * No `certtool --verify` against itself: GnuTLS refuses a non-CA self-signed
+     * certificate as its own trust anchor ("issuer is not a CA").
+     */
+    private static X509Certificate makeAliceCertViaToken(String outPem) throws Exception {
+        writeCertTemplate();
+        p11Ok("certtool", "--generate-self-signed",
+                "--load-privkey", p11ObjectUrl("private"), "--load-pubkey", p11ObjectUrl("public"),
+                "--template", "/tmp/p11-tmpl", "--hash", "SHA256", "--outfile", outPem);
+        String pem = p11Ok("cat", outPem).getStdout();
+        X509Certificate cert = (X509Certificate) CertificateFactory.getInstance("X.509")
+                .generateCertificate(new java.io.ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII)));
+        byte[] expectedSpki = HexFormat.of().parseHex(P256_SPKI_PREFIX_HEX + ALICE_TLS_PUB_HEX);
+        assertArrayEquals(expectedSpki, cert.getPublicKey().getEncoded(), "the token's key is Alice's");
+        return cert;
+    }
+
+    // ==================== X.509 helpers ====================
+
+    /** A JSON-RPC 2.0 request line. */
+    private static String rpc(int id, String method, JsonObject params) {
+        JsonObject request = new JsonObject();
+        request.addProperty("jsonrpc", "2.0");
+        request.addProperty("id", id);
+        request.addProperty("method", method);
+        request.add("params", params);
+        return request.toString();
+    }
+
+    private static String x509SignRequest(String path, byte[] digest) {
+        JsonObject params = new JsonObject();
+        params.addProperty("path", path);
+        params.addProperty("digest", Base64.getEncoder().encodeToString(digest));
+        return rpc(2, "sign", params);
+    }
+
+    /** The single key in a list result; fails if there isn't exactly one. */
+    private static JsonObject onlyX509Key(JsonObject listResponse) {
+        JsonArray keys = listResponse.getAsJsonObject("result").getAsJsonArray("keys");
+        assertEquals(1, keys.size(), "exactly Alice's TLS-client key: " + listResponse);
+        return keys.get(0).getAsJsonObject();
+    }
+
+    private static byte[] base64Field(JsonObject object, String field) {
+        assertTrue(object.has(field), "missing '" + field + "': " + object);
+        return Base64.getDecoder().decode(object.get(field).getAsString());
+    }
+
+    /** PID(s) of km-x509-sa in the avatar container, or "" if none. */
+    private static String x509SaPid() throws Exception {
+        return avatar.execInContainer("pgrep", "-x", "km-x509-sa").getStdout().trim();
+    }
+
+    /**
+     * Send one request to km-x509-sa, retrying every 500 ms until the reply
+     * has a result. Covers both "session not up yet" (error reply) and "SA
+     * socket not bound yet" (connection failure).
+     */
+    private static JsonObject awaitX509Result(String request, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        String last = "no attempt";
+        while (true) {
+            try {
+                JsonObject response = x509Sa(request);
+                if (response.has("result")) {
+                    return response;
+                }
+                last = response.toString();
+            } catch (RuntimeException e) {
+                last = e.getMessage();
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                fail("km-x509-sa gave no result within " + timeoutMs + " ms; last: " + last);
+            }
+            Thread.sleep(500);
+        }
+    }
+
+    private static JsonObject x509Sa(String request) throws Exception {
+        return lineRpc(avatar, X509_SA_SOCK, request).get(0);
+    }
+
+    /**
+     * Send newline-delimited JSON-RPC requests over ONE connection to a unix
+     * socket in the container, reading one reply line per request. One
+     * connection matters for the avatar local API, where "connect" binds it.
+     *
+     * <p>The 40 s socket timeout is above km-x509-sa's 35 s request timeout,
+     * which is above the avatar's 30 s Nostr timeout, so the real error
+     * always arrives before Python gives up.
+     */
+    private static List<JsonObject> lineRpc(GenericContainer<?> container, String socketPath,
+            String... requests) throws Exception {
+        String script = String.join("\n",
+                "import socket,sys",
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)",
+                "s.settimeout(40)",
+                "s.connect(sys.argv[1])",
+                "f=s.makefile('rwb')",
+                "for req in sys.argv[2:]:",
+                "  f.write(req.encode()+b'\\n')",
+                "  f.flush()",
+                "  line=f.readline()",
+                "  if not line: raise Exception('EOF')",
+                "  print(line.decode().strip())",
+                "s.close()");
+        String[] command = new String[4 + requests.length];
+        command[0] = "python3";
+        command[1] = "-c";
+        command[2] = script;
+        command[3] = socketPath;
+        System.arraycopy(requests, 0, command, 4, requests.length);
+
+        var result = container.execInContainer(command);
+        if (result.getExitCode() != 0) {
+            throw new RuntimeException("request to " + socketPath + " failed (exit="
+                    + result.getExitCode() + "): " + result.getStderr());
+        }
+        List<JsonObject> replies = result.getStdout().lines()
+                .filter(line -> !line.isBlank())
+                .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                .toList();
+        if (replies.size() != requests.length) {
+            throw new RuntimeException("expected " + requests.length + " replies, got: "
+                    + result.getStdout());
+        }
+        return replies;
+    }
+
+    /**
+     * Verify a raw r||s P-256 signature over {@code message} with
+     * SHA256withECDSA. Java's verifier wants DER, so r and s are wrapped in
+     * an ASN.1 SEQUENCE of two INTEGERs first.
+     */
+    private static boolean verifyP256(byte[] uncompressedPoint, byte[] message, byte[] rawSignature)
+            throws Exception {
+        AlgorithmParameters parameters = AlgorithmParameters.getInstance("EC", "SunEC");
+        parameters.init(new ECGenParameterSpec("secp256r1"));
+        ECParameterSpec curve = parameters.getParameterSpec(ECParameterSpec.class);
+
+        java.security.spec.ECPoint point = new java.security.spec.ECPoint(
+                new BigInteger(1, Arrays.copyOfRange(uncompressedPoint, 1, 33)),
+                new BigInteger(1, Arrays.copyOfRange(uncompressedPoint, 33, 65)));
+        PublicKey publicKey = KeyFactory.getInstance("EC", "SunEC")
+                .generatePublic(new ECPublicKeySpec(point, curve));
+
+        BigInteger r = new BigInteger(1, Arrays.copyOfRange(rawSignature, 0, 32));
+        BigInteger s = new BigInteger(1, Arrays.copyOfRange(rawSignature, 32, 64));
+        byte[] der = new DERSequence(new ASN1Encodable[] {
+                new ASN1Integer(r), new ASN1Integer(s)}).getEncoded();
+
+        Signature verifier = Signature.getInstance("SHA256withECDSA", "SunEC");
+        verifier.initVerify(publicKey);
+        verifier.update(message);
+        return verifier.verify(der);
     }
 
     // ==================== Helpers ====================
