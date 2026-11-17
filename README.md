@@ -26,8 +26,8 @@ those first — see the build order in
 The versions it builds against are pinned in `pom.xml`:
 
 ```xml
-<keymaster.version>0.7.3</keymaster.version>
-<keyvault.version>0.4.0</keyvault.version>
+<keymaster.version>0.8.0</keymaster.version>
+<keyvault.version>0.5.0</keyvault.version>
 ```
 
 Bump those pins when a new keymaster or keyvault is released, or this
@@ -50,16 +50,17 @@ mvn test -Davatar.binary=$AV/keymaster-avatar \
   -Dnostr.avatar.binary=$AV/km-nostr-sa -Dx509.avatar.binary=$AV/km-x509-sa \
   -Dpkcs11.x509.module=$AV/libkm_pkcs11_x509.so \
   -Dscd.shim.binary=$AV/scd-shim \
-  -Dx509.enrolment.script=$HOME/git/keymaster-avatar/doc/x509-enrolment.sh
+  -Dx509.enrolment.script=$HOME/git/keymaster-avatar/doc/x509-enrolment.sh \
+  -Dx509.openvpn.script=$HOME/git/keymaster-avatar/doc/x509-openvpn.sh
 ```
 
-`pkcs11.x509.module` and `x509.enrolment.script` have no default: without
-them the suite fails, it does not skip. `X509EnrolmentTest` copies the
+`pkcs11.x509.module`, `x509.enrolment.script` and `x509.openvpn.script`
+have no default: without them the suite fails, it does not skip. `X509EnrolmentTest` copies the
 enrolment script (the runbook's single source) into the avatar container
 and runs its steps one by one against its own fresh KeyMaster.
 
-Expect `Tests run: 47` (34 from `KeyMasterAvatarTest`, 13 from
-`X509EnrolmentTest`) and a build that takes roughly four minutes, most of
+Expect `Tests run: 56` (34 from `KeyMasterAvatarTest`, 13 from
+`X509EnrolmentTest`, 9 from `X509OpenVpnTest`) and a build that takes roughly four minutes, most of
 it spent building container images.
 
 ### The LXC system test
