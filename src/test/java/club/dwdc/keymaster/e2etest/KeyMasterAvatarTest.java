@@ -443,6 +443,106 @@ class KeyMasterAvatarTest {
         }
     }
 
+    /**
+     * Signing with a key the attached KeyMaster does not hold must fail
+     * and produce no signature (mission 49, bug
+     * scd-shim-pksign-wrong-key-fallback). Before the fix, scd-shim fell
+     * back to the OPENPGP.3 identity and signed with Alice's key, which
+     * gpg reported as a BAD signature from Bob.
+     *
+     * <p>Bob's key is generated in a separate home, then imported into
+     * the avatar's GnuPG home as a public key with a card stub, so
+     * gpg-agent sends PKSIGN with Bob's keygrip to scd-shim.
+     */
+    @Test
+    @Order(31)
+    void gpgSignWithKeyNotOnKeyMasterFails() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-gpg-unknown.json", "gpg");
+
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            Thread.sleep(12000); // km-gpg-sa setup, as in gpgSignAndVerify
+
+            String setup = String.join("\n",
+                    "set -e",
+                    "B=/tmp/bob-home; rm -rf $B; mkdir -m 700 $B",
+                    "gpg --homedir $B --batch --passphrase '' --quick-gen-key 'Bob <bob@biloxi.com>' ed25519 sign never",
+                    "gpg --homedir $B --batch --export bob@biloxi.com > /tmp/bob.pub",
+                    "GRIP=$(gpg --homedir $B --batch --with-colons --with-keygrip --list-keys bob@biloxi.com | awk -F: '/^grp:/{print $10; exit}')",
+                    "gpg --homedir /tmp/gnupg-home --batch --import /tmp/bob.pub",
+                    // Turn Bob's private key file into a card stub: same q, no d.
+                    "perl -0pe 's/\\(private-key/(shadowed-private-key/; s/\\(d\\s*#[0-9A-Fa-f]+#\\)/(shadowed t1-v1 (#D2760001240103000000000000000100# OPENPGP.1))/s' "
+                            + "$B/private-keys-v1.d/$GRIP.key > /tmp/gnupg-home/private-keys-v1.d/$GRIP.key",
+                    "chmod 600 /tmp/gnupg-home/private-keys-v1.d/$GRIP.key",
+                    "grep -q shadowed /tmp/gnupg-home/private-keys-v1.d/$GRIP.key",
+                    "! grep -q '(d' /tmp/gnupg-home/private-keys-v1.d/$GRIP.key",
+                    "gpgconf --homedir /tmp/gnupg-home --reload gpg-agent",
+                    "echo $GRIP > /tmp/bob.grip",
+                    "echo 'test message' > /tmp/unknown.txt",
+                    "rm -f /tmp/unknown.txt.asc");
+            var setupResult = avatar.execInContainer("bash", "-c", setup);
+            log.info("Bob stub setup: exit={}, stdout={}, stderr={}",
+                    setupResult.getExitCode(), setupResult.getStdout(), setupResult.getStderr());
+            assertEquals(0, setupResult.getExitCode(),
+                    "Setting up Bob's stub should succeed. stderr: " + setupResult.getStderr());
+            String bobGrip = avatar.execInContainer("cat", "/tmp/bob.grip").getStdout().trim();
+
+            var signResult = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home",
+                    "--batch", "--yes", "--clearsign",
+                    "--pinentry-mode", "loopback", "--passphrase", "",
+                    "-u", "bob@biloxi.com",
+                    "/tmp/unknown.txt");
+            log.info("GPG sign as Bob: exit={}, stdout={}, stderr={}",
+                    signResult.getExitCode(), signResult.getStdout(), signResult.getStderr());
+
+            assertNotEquals(0, signResult.getExitCode(),
+                    "Signing with a key the KeyMaster does not hold must fail. stderr: "
+                            + signResult.getStderr());
+            assertTrue(signResult.getStderr().contains("No secret key"),
+                    "gpg should report 'No secret key'. stderr: " + signResult.getStderr());
+            var exists = avatar.execInContainer("test", "-e", "/tmp/unknown.txt.asc");
+            assertNotEquals(0, exists.getExitCode(),
+                    "No signature file may be written for a key the KeyMaster does not hold");
+
+            // The refusal must come from scd-shim, not from a broken stub.
+            var shimLog = avatar.execInContainer("bash", "-c",
+                    "cat /tmp/gnupg-home/scd-shim.log /tmp/scd-shim.log 2>/dev/null");
+            assertTrue(shimLog.getStdout().contains("PKSIGN: refused, no attached key matches " + bobGrip),
+                    "scd-shim should log the refusal for Bob's keygrip " + bobGrip
+                            + ". log tail: " + tail(shimLog.getStdout(), 20));
+
+            // Alice's own key still signs after the refusal.
+            var aliceSign = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home",
+                    "--batch", "--yes", "--clearsign",
+                    "--pinentry-mode", "loopback", "--passphrase", "",
+                    "-u", "alice@atlanta.com",
+                    "/tmp/unknown.txt");
+            assertEquals(0, aliceSign.getExitCode(),
+                    "Alice's key should still sign. stderr: " + aliceSign.getStderr());
+            var aliceVerify = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home",
+                    "--batch", "--verify", "/tmp/unknown.txt.asc");
+            assertEquals(0, aliceVerify.getExitCode(),
+                    "Alice's signature should verify. stderr: " + aliceVerify.getStderr());
+        } finally {
+            avatar.execInContainer("bash", "-c",
+                    "G=$(cat /tmp/bob.grip 2>/dev/null); "
+                            + "[ -n \"$G\" ] && rm -f /tmp/gnupg-home/private-keys-v1.d/$G.key; "
+                            + "gpg --homedir /tmp/gnupg-home --batch --yes --delete-keys "
+                            + "$(gpg --homedir /tmp/gnupg-home --batch --with-colons --list-keys bob@biloxi.com 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}') 2>/dev/null; true");
+            detachViaController();
+            Thread.sleep(500);
+        }
+    }
+
+    private static String tail(String text, int lines) {
+        String[] all = text.split("\n");
+        return String.join("\n", java.util.Arrays.copyOfRange(all, Math.max(0, all.length - lines), all.length));
+    }
+
     @Test
     @Order(40)
     void serviceProcessRespawnsOnCrash() throws Exception {
