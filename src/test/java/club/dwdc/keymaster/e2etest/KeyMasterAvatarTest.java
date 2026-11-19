@@ -1550,11 +1550,11 @@ class KeyMasterAvatarTest {
     private static final String AVATAR_API_SOCK = "/tmp/keymaster-avatar.sock";
 
     /** Alice's TLS-client key, as KeyMaster derives and labels it. */
-    private static final String ALICE_TLS_PATH = "m/44'/1240'/1955269225'/196866'/0'";
+    private static final String ALICE_TLS_PATH = "m/44'/1240'/1955269225'/2'/0'"; // 196866' before keymaster 0.9.0
     private static final String ALICE_TLS_LABEL = "alice@atlanta.com tls-client";
     private static final String ALICE_TLS_PUB_HEX =
-            "04b99b60d501f8c4410839779fbea199d87b83dd675ffba53223529adfd0f05a"
-            + "c83c199adda4b7b7aaad50afd3ed4b230361e6ce56ea78790707cb7d84a81a2a81";
+            "04c668dd0ec2699cd16e97b2a8a0dc6631b078309c1263757621234186e93db4"
+            + "d770dbaa62e4036255300087d5c43e872cd6fb242a9f87a80786643da9067a53f6";
 
     private static final String X509_LIST = rpc(1, "list", new JsonObject());
     private static final byte[] X509_MESSAGE =
@@ -2246,13 +2246,13 @@ class KeyMasterAvatarTest {
                 44 | H,
                 club.dwdc.keyvault.core.Protocol.NOSTR.coinType() | H,
                 club.dwdc.keyvault.core.Bip32KeyDerivator.mangle("alice@home.org") | H,
-                new club.dwdc.keyvault.core.AlgField(
-                        club.dwdc.keyvault.core.AlgField.ALG_SCHNORR, 0, 0).toIndex() | H,
+                new club.dwdc.keyvault.core.UseField(0, 0).toIndex() | H,
                 new club.dwdc.keyvault.core.ConfigField(
                         club.dwdc.keyvault.core.ConfigField.CSPRNG_NONE, 0).toIndex() | H
         };
         byte[] compressed = createVaultInProcess()
-                .execute(club.dwdc.keyvault.core.KeyVault.FN_GET_PUBLIC_KEY, null, path).data();
+                .execute(club.dwdc.keyvault.core.Alg.SECP256K1,
+                        club.dwdc.keyvault.core.KeyVault.FN_GET_PUBLIC_KEY, 0, null, path).data();
         StringBuilder hex = new StringBuilder();
         for (int i = 1; i < 33; i++) {
             hex.append(String.format("%02x", compressed[i]));

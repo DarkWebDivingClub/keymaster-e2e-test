@@ -1,6 +1,7 @@
 package club.dwdc.keymaster.e2etest;
 
-import club.dwdc.keyvault.core.AlgField;
+import club.dwdc.keyvault.core.Alg;
+import club.dwdc.keyvault.core.UseField;
 import club.dwdc.keyvault.core.Bip32KeyVault;
 import club.dwdc.keyvault.core.ConfigField;
 import club.dwdc.keyvault.core.KeyVault;
@@ -571,11 +572,11 @@ class KeyMasterSystemTest {
                 44 | H,
                 Protocol.NOSTR.coinType() | H,
                 mangled | H,
-                new AlgField(AlgField.ALG_SCHNORR, 0, 0).toIndex() | H,
+                new UseField(0, 0).toIndex() | H,
                 new ConfigField(ConfigField.CSPRNG_NONE, 0).toIndex() | H
         };
         return NostrUtil.bytesToHex(
-                vault.execute(KeyVault.FN_GET_PUBLIC_KEY, null, path).data());
+                vault.execute(Alg.SECP256K1, KeyVault.FN_GET_PUBLIC_KEY, 0, null, path).data());
     }
 
     // ── Container file helpers ───────────────────────────────────────────
