@@ -14,8 +14,8 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <keymaster.version>0.8.1</keymaster.version>
-        <keyvault.version>0.5.0</keyvault.version>
+        <keymaster.version>0.9.0-SNAPSHOT</keymaster.version>
+        <keyvault.version>0.6.0-SNAPSHOT</keyvault.version>
         <junit.version>5.13.1</junit.version>
         <surefire.version>3.5.2</surefire.version>
         <testcontainers.version>1.20.6</testcontainers.version>
