@@ -538,6 +538,90 @@ class KeyMasterAvatarTest {
         }
     }
 
+    /**
+     * New keys must be usable with several identities attached (mission 51).
+     * scd-shim used to give every key after the second the keyref
+     * OPENPGP.1; since mission 49 READKEY refuses a shared keyref, so
+     * gpg-agent's LEARN wrote no shadow stubs and km-gpg-sa wrote
+     * unparsable placeholders instead: every key was {@code sec#}.
+     *
+     * <p>All stubs are deleted before the attach, so every key is new to
+     * gpg, as after the 0.6.0 key change.
+     */
+    @Test
+    @Order(32)
+    void gpgNewKeysUsableWithTwoIdentities() throws Exception {
+        JsonObject createParams = new JsonObject();
+        createParams.addProperty("identity", "alice@home.net");
+        createParams.addProperty("pgp_name", "Alice");
+        createParams.addProperty("pgp_email", "alice@home.net");
+        JsonObject created = daemonController.handle("identity.create", createParams);
+        assertFalse(created.has("error"), "identity.create failed: " + created);
+
+        avatar.execInContainer("bash", "-c",
+                "rm -f /tmp/gnupg-home/private-keys-v1.d/*.key /tmp/gnupg-home/scd-shim.log /tmp/scd-shim.log");
+
+        Path descriptorFile = writeDescriptor("descriptor-gpg-two.json", "gpg");
+        JsonArray also = new JsonArray();
+        also.add("alice@home.net");
+        attachNewRealm(descriptorFile.toString(), "alice@atlanta.com", "two", also);
+
+        try {
+            // Restart km-gpg-sa (the entrypoint loop starts it again), as the
+            // 48.6 runbook does after a key change, so its setup and LEARN run
+            // for the attached keys. Then wait for setup, as in gpgSignAndVerify.
+            Thread.sleep(2000);
+            avatar.execInContainer("pkill", "-x", "km-gpg-sa");
+            Thread.sleep(12000);
+
+            var shimLog = avatar.execInContainer("bash", "-c",
+                    "cat /tmp/gnupg-home/scd-shim.log /tmp/scd-shim.log 2>/dev/null"
+                            + " | grep -o 'keyref=OPENPGP\\.[0-9]*' | sort -u");
+            assertEquals(4, shimLog.getStdout().lines().count(),
+                    "four keys need four different keyrefs. got: " + shimLog.getStdout());
+
+            var placeholders = avatar.execInContainer("bash", "-c",
+                    "find /tmp/gnupg-home/private-keys-v1.d -name '*.key' -size -40c | wc -l");
+            assertEquals("0", placeholders.getStdout().trim(), "no placeholder stub may exist");
+
+            var listed = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home", "--batch", "-K");
+            assertFalse(listed.getStdout().contains("sec#") || listed.getStdout().contains("ssb#"),
+                    "every key must be on the card (sec>), none unavailable (sec#):\n"
+                            + listed.getStdout());
+            assertEquals(4, listed.getStdout().lines()
+                    .filter(l -> l.startsWith("sec>") || l.startsWith("ssb>")).count(),
+                    "two identities, four card keys:\n" + listed.getStdout());
+
+            for (String who : new String[]{"alice@atlanta.com", "alice@home.net"}) {
+                avatar.execInContainer("bash", "-c",
+                        "echo 'two identities' > /tmp/two.txt; rm -f /tmp/two.txt.asc");
+                var sign = avatar.execInContainer(
+                        "gpg", "--homedir", "/tmp/gnupg-home",
+                        "--batch", "--yes", "--clearsign",
+                        "--pinentry-mode", "loopback", "--passphrase", "",
+                        "-u", who, "/tmp/two.txt");
+                assertEquals(0, sign.getExitCode(), who + " must sign. stderr: " + sign.getStderr());
+                var verify = avatar.execInContainer(
+                        "gpg", "--homedir", "/tmp/gnupg-home",
+                        "--batch", "--verify", "/tmp/two.txt.asc");
+                assertEquals(0, verify.getExitCode(), who + " must verify. stderr: " + verify.getStderr());
+                assertTrue(verify.getStderr().contains("<" + who + ">"),
+                        "signature must be from " + who + ". stderr: " + verify.getStderr());
+            }
+        } finally {
+            avatar.execInContainer("bash", "-c",
+                    "for g in $(gpg --homedir /tmp/gnupg-home --batch --with-colons --with-keygrip "
+                            + "--list-keys alice@home.net 2>/dev/null | awk -F: '/^grp:/{print $10}'); do "
+                            + "rm -f /tmp/gnupg-home/private-keys-v1.d/$g.key; done; "
+                            + "gpg --homedir /tmp/gnupg-home --batch --yes --delete-keys "
+                            + "$(gpg --homedir /tmp/gnupg-home --batch --with-colons --list-keys alice@home.net "
+                            + "2>/dev/null | awk -F: '/^fpr:/{print $10; exit}') 2>/dev/null; true");
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
     private static String tail(String text, int lines) {
         String[] all = text.split("\n");
         return String.join("\n", java.util.Arrays.copyOfRange(all, Math.max(0, all.length - lines), all.length));
