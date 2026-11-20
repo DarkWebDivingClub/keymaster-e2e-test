@@ -622,6 +622,62 @@ class KeyMasterAvatarTest {
         }
     }
 
+    /**
+     * km-gpg-sa must recover by itself when the avatar socket it is
+     * connected to goes away (mission 52, bug
+     * gpg-sa-unknown-packet-after-reconnect). Before the fix it stayed up
+     * with a dead connection and gpg failed with "Unknown packet" until
+     * km-gpg-sa was restarted by hand.
+     *
+     * <p>The avatar here is the container's main process and cannot be
+     * restarted, so the test moves its socket away: km-gpg-sa's watchdog
+     * sees the socket removed and exits, the entrypoint loop (standing in
+     * for Restart=on-failure) starts it again, and the new process waits
+     * for the socket. Moving it back must give a working gpg with no
+     * manual restart. The real avatar restart is covered in LXC
+     * (manual-test/avatar-restart-0.8.3.md).
+     */
+    @Test
+    @Order(33)
+    void gpgRecoversAfterAvatarSocketReplaced() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-gpg-socket.json", "gpg");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
+
+        try {
+            Thread.sleep(12000); // km-gpg-sa setup, as in gpgSignAndVerify
+            String before = avatar.execInContainer("pgrep", "-x", "km-gpg-sa").getStdout().trim();
+            assertFalse(before.isEmpty(), "km-gpg-sa must be running");
+
+            avatar.execInContainer("mv", "/tmp/keymaster-avatar.sock", "/tmp/keymaster-avatar.sock.away");
+            try {
+                Thread.sleep(8000); // watchdog interval is 5 s
+            } finally {
+                avatar.execInContainer("mv", "/tmp/keymaster-avatar.sock.away", "/tmp/keymaster-avatar.sock");
+            }
+
+            String after = avatar.execInContainer("pgrep", "-x", "km-gpg-sa").getStdout().trim();
+            assertNotEquals(before, after,
+                    "km-gpg-sa must have exited and been restarted (pid " + before + ")");
+
+            Thread.sleep(15000); // reconnect backoff plus setup and LEARN
+            avatar.execInContainer("bash", "-c",
+                    "echo 'after socket swap' > /tmp/swap.txt; rm -f /tmp/swap.txt.asc");
+            var sign = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home",
+                    "--batch", "--yes", "--clearsign",
+                    "--pinentry-mode", "loopback", "--passphrase", "",
+                    "/tmp/swap.txt");
+            assertEquals(0, sign.getExitCode(),
+                    "gpg must sign with no manual km-gpg-sa restart. stderr: " + sign.getStderr());
+            var verify = avatar.execInContainer(
+                    "gpg", "--homedir", "/tmp/gnupg-home", "--batch", "--verify", "/tmp/swap.txt.asc");
+            assertEquals(0, verify.getExitCode(), "must verify. stderr: " + verify.getStderr());
+        } finally {
+            detachAll();
+            Thread.sleep(500);
+        }
+    }
+
     private static String tail(String text, int lines) {
         String[] all = text.split("\n");
         return String.join("\n", java.util.Arrays.copyOfRange(all, Math.max(0, all.length - lines), all.length));
