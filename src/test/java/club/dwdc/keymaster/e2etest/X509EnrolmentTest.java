@@ -50,7 +50,8 @@ import static org.junit.jupiter.api.Assertions.*;
  *   <li>the certificate is deposited on the token;</li>
  *   <li>a gnutls client-auth handshake uses it, with a negative control.</li>
  * </ul>
- * It also covers the rejections (wrong EKU, foreign key) and renewal. Every
+ * It also covers the rejections (wrong EKU, foreign key) and a rerun of the
+ * enrolment for the same key, which replaces the certificate (mission 50). Every
  * step is asserted on its exit code and on the script's {@code ok}/{@code FAIL}
  * lines.
  *
@@ -293,7 +294,8 @@ class X509EnrolmentTest {
         assertStep(step("deposit"), 0,
                 "ok   deposit: certificate SPKI sha256 == token CKA_ID: certificate and key pair",
                 "ok   deposit: token lists 3 objects (private key, public key, certificate), one shared ID",
-                "ok   deposit: exactly one certificate on the token");
+                "ok   deposit: exactly one certificate on the token",
+                "ok   deposit: the token's certificate is alice.crt (");
 
         // Independently of the script
         var all = p11Ok("p11tool", "--batch", "--list-all", P11_TOKEN);
@@ -360,20 +362,55 @@ class X509EnrolmentTest {
         }
     }
 
+    /**
+     * Mission 50: the enrolment run again for the same key, every step but
+     * make_test_pki. check_cert_state records the stored serial, and deposit
+     * replaces the certificate with the new one.
+     */
     @Test
     @Order(120)
-    void renewalReplacesCertificate() throws Exception {
+    void rerunReplacesCertificate() throws Exception {
         listKey();
+        String oldSerial = p11Ok("openssl", "x509", "-in", WORKDIR + "/alice.crt", "-noout", "-serial")
+                .getStdout().trim().replace("serial=", "");
+
+        var state = assertStep(step("check_cert_state"), 0,
+                "ok   check_cert_state: one certificate on the token, serial " + oldSerial + " recorded: a rerun");
+        assertTrue(out(state).contains("CN=alice@atlanta.com"), "the stored certificate is shown\n" + out(state));
+
+        assertStep(step("select_key"), 0, "ok   select_key: exactly one tls-client key pair");
+        assertStep(step("make_csr"), 0, "ok   make_csr: CSR SPKI sha256 == token CKA_ID");
         assertStep(step("ca_issue", "CERT_FILE=alice2.crt"), 0, "ok   ca_issue: alice2.crt written");
+        assertStep(step("verify_chain", "CERT_FILE=alice2.crt"), 0,
+                "ok   verify_chain: certificate SPKI sha256 == token CKA_ID");
         assertStep(step("deposit", "CERT_FILE=alice2.crt"), 0,
                 "ok   deposit: certificate SPKI sha256 == token CKA_ID: certificate and key pair",
                 "ok   deposit: token lists 3 objects (private key, public key, certificate), one shared ID",
-                "ok   deposit: exactly one certificate on the token");
+                "ok   deposit: exactly one certificate on the token",
+                "ok   deposit: the new certificate (");
 
         assertNotEquals(fileFingerprint("alice.crt"), fileFingerprint("alice2.crt"), "a new certificate");
         assertEquals(fileFingerprint("alice2.crt"), tokenCertFingerprint(), "the token holds the new certificate");
         byte[] stored = base64Field(listKey(), "cert");
         assertArrayEquals(der("alice2.der"), stored, "km-x509-sa list returns the new certificate");
+
+        try {
+            assertStep(step("handshake", "CERT_FILE=alice2.crt"), 0,
+                    "ok   handshake: HTTP/1.0 200 OK, and the server's page shows the peer CN=alice@atlanta.com");
+        } finally {
+            assertPortFree();
+        }
+    }
+
+    /** A rerun with nothing new to deposit: deposit sees the earlier certificate still there and fails. */
+    @Test
+    @Order(130)
+    void rerunDepositOfTheSameCertificateFails() throws Exception {
+        listKey();
+        assertStep(step("check_cert_state"), 0, "ok   check_cert_state: one certificate on the token, serial ");
+        var r = assertStep(step("deposit", "CERT_FILE=alice2.crt"), 1,
+                "FAIL deposit: the token still holds the earlier certificate");
+        assertEquals(fileFingerprint("alice2.crt"), tokenCertFingerprint(), "unchanged\n" + out(r));
     }
 
     // ==================== script and token helpers ====================
@@ -420,11 +457,11 @@ class X509EnrolmentTest {
         assertTokenHasNoCert();
     }
 
-    /** check_no_cert passes and KeyMaster's list has no certificate. */
+    /** check_cert_state finds a first enrolment and KeyMaster's list has no certificate. */
     private static void assertTokenHasNoCert() throws Exception {
         JsonObject key = listKey();
         assertFalse(key.has("cert"), "KeyMaster holds no certificate: " + key);
-        assertStep(step("check_no_cert"), 0, "ok   check_no_cert: no certificate on the token");
+        assertStep(step("check_cert_state"), 0, "ok   check_cert_state: no certificate on the token");
     }
 
     /** Nothing listens on TCP 4433 (hex 1151) in the avatar container: no LISTEN (0A) row in /proc/net/tcp{,6}. */
